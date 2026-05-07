@@ -1,13 +1,15 @@
 import logging
 import base64
 import re
+import io
 from datetime import datetime
 import httpx
+from PIL import Image
+import pytesseract
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
 TELEGRAM_TOKEN = "8584043315:AAFCPZuQ8jIGtt9r9iQXielvDCFbiLyF5xg"
-GOOGLE_VISION_API_KEY = "AIzaSyAOH5fLerbK_Qr3t9gYufqkIRo2e_Kkye8"
 SPREADSHEET_ID = "1KD47gg9pUKVue49s6pnoRHB0xutjHxGABn610mgH9mw"
 APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxKAsxVijAYdZlRTXWA2ItiiGFirG6hsGhZ-F7lgR1s_gbghJF9nEN-WTeTTanM8fOSgg/exec"
 
@@ -38,10 +40,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = await client.get(file.file_path)
         image_bytes = response.content
 
-    image_base64 = base64.standard_b64encode(image_bytes).decode("utf-8")
-    raw_text = await read_text_with_vision(image_base64)
+    raw_text = read_text_with_tesseract(image_bytes)
+    logger.info("OCR natija: " + raw_text[:200])
 
-    if not raw_text:
+    if not raw_text.strip():
         await update.message.reply_text("Rasmdan matn oqib bolmadi. Aniqroq rasm yuboring.")
         return ConversationHandler.END
 
@@ -55,29 +57,20 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAITING_PRICE
 
 
-async def read_text_with_vision(image_base64):
+def read_text_with_tesseract(image_bytes):
     try:
-        url = "https://vision.googleapis.com/v1/images:annotate?key=" + GOOGLE_VISION_API_KEY
-        payload = {
-            "requests": [{
-                "image": {"content": image_base64},
-                "features": [{"type": "TEXT_DETECTION", "maxResults": 1}],
-                "imageContext": {"languageHints": ["ru", "uz"]}
-            }]
-        }
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(url, json=payload)
-            data = response.json()
+        image = Image.open(io.BytesIO(image_bytes))
+        # Rasmni kattalashtirish (OCR uchun yaxshiroq)
+        width, height = image.size
+        if width < 1000:
+            scale = 1000 / width
+            image = image.resize((int(width * scale), int(height * scale)), Image.LANCZOS)
 
-        responses = data.get("responses", [])
-        if not responses:
-            return ""
-        annotations = responses[0].get("textAnnotations", [])
-        if not annotations:
-            return ""
-        return annotations[0].get("description", "")
+        # Rus va ingliz tilida o'qish
+        text = pytesseract.image_to_string(image, lang="rus+eng")
+        return text
     except Exception as e:
-        logger.error("Vision API xatosi: " + str(e))
+        logger.error("Tesseract xatosi: " + str(e))
         return ""
 
 
@@ -124,7 +117,7 @@ def parse_nakladnoy(text):
 
     total_dona = 0
     for line in lines:
-        match = re.search(r"(\d+)\s*(sht|dona)", line, re.IGNORECASE)
+        match = re.search(r"(\d+)\s*(sht|dona|шт)", line, re.IGNORECASE)
         if match:
             try:
                 total_dona += int(match.group(1))
@@ -132,7 +125,7 @@ def parse_nakladnoy(text):
                 pass
     result["jami_dona"] = total_dona
 
-    mahsulot_matches = re.findall(r"(30/1[^\n]*(?:Ribana|Suprem|Penye)[^\n]*)", text, re.IGNORECASE)
+    mahsulot_matches = re.findall(r"(30[/\\]\d[^\n]*(?:Ribana|Suprem|Penye|karde)[^\n]*)", text, re.IGNORECASE)
     for m in mahsulot_matches[:6]:
         result["mahsulotlar"].append({"nomi": m.strip()})
 
@@ -140,26 +133,18 @@ def parse_nakladnoy(text):
 
 
 def format_data(data):
-    fabrika = data.get("fabrika", "Aniqlanmadi")
-    sana = data.get("sana", "")
-    oluvchi = data.get("oluvchi", "Aniqlanmadi")
-    jami_metr = data.get("jami_metr", 0)
-    jami_dona = data.get("jami_dona", 0)
-
     lines = [
-        "Fabrika: " + fabrika,
-        "Sana: " + sana,
-        "Oluvchi: " + oluvchi,
-        "Jami metr: " + str(jami_metr),
-        "Jami dona: " + str(jami_dona),
+        "Fabrika: " + data.get("fabrika", "Aniqlanmadi"),
+        "Sana: " + data.get("sana", ""),
+        "Oluvchi: " + data.get("oluvchi", "Aniqlanmadi"),
+        "Jami metr: " + str(data.get("jami_metr", 0)),
+        "Jami dona: " + str(data.get("jami_dona", 0)),
     ]
-
     mahsulotlar = data.get("mahsulotlar", [])
     if mahsulotlar:
         lines.append("\nMahsulotlar:")
         for i, m in enumerate(mahsulotlar, 1):
             lines.append("  " + str(i) + ". " + m.get("nomi", ""))
-
     return "\n".join(lines)
 
 
@@ -182,11 +167,10 @@ async def handle_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Google Sheets ga yozilmoqda...")
     success = await send_to_sheets(data, narx, jami_summa)
 
-    fabrika = data.get("fabrika", "Noma'lum")
     if success:
         msg = (
             "Saqlandi!\n\n"
-            "Fabrika: " + fabrika + "\n"
+            "Fabrika: " + data.get("fabrika", "Noma'lum") + "\n"
             "Jami: " + str(jami_metr) + " metr\n"
             "Narx: " + str(int(narx)) + " som/metr\n"
             "Jami summa: " + str(int(jami_summa)) + " som\n\n"
